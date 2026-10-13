@@ -1,0 +1,201 @@
+<div align="center">
+  <h1>Jittor Harness</h1>
+
+  <p>
+    <strong>供 PyTorch → Jittor 迁移 Agent 调用的可复现执行与验证工具。</strong><br>
+    Jittor Harness 为代码 Agent 提供冻结任务下的双端执行、证据采集和唯一验收，当前重点支持
+    PyTorch 到 Jittor 的迁移。
+  </p>
+
+  <p>
+    <img alt="python" src="https://img.shields.io/badge/python-%E2%89%A53.10-3776AB?logo=python&logoColor=white">
+    <img alt="Jittor" src="https://img.shields.io/badge/target-Jittor-2F6BFF">
+    <img alt="Ascend" src="https://img.shields.io/badge/accelerator-Ascend-E6242E">
+    <img alt="Agent" src="https://img.shields.io/badge/interface-code%20agent-7A5AF8">
+    <img alt="evidence" src="https://img.shields.io/badge/method-verification-F27CA5">
+  </p>
+
+  <p>
+    中文 ·
+    <a href="README_en.md">English</a>
+  </p>
+
+  <p>
+    <a href="#系统架构">系统架构</a> ·
+    <a href="#项目定位">项目定位</a> ·
+    <a href="#快速开始">快速开始</a> ·
+    <a href="#实验图表">实验图表</a> ·
+    <a href="#当前状态">当前状态</a>
+  </p>
+</div>
+
+Jittor Harness 是项目的对外名称。为了保持现有脚本和任务兼容，Python 包和命令行仍使用
+`torchport`；本文中的 TorchPort 特指 Harness 内部的执行与数值验证核心。
+
+## 系统架构
+
+<div align="center">
+  <img src="docs/assets/torchport-architecture.png" alt="Jittor Harness 系统架构" width="100%">
+</div>
+
+Jittor Harness 的核心假设很简单：模型迁移不能只看代码是否被替换，更要看迁移后的模型能否保持数值行为与性能对齐。
+
+系统由两层组成。外部代码 Agent 阅读未知 PyTorch 仓库、编写 Jittor candidate 并选择修复；TorchPort 按冻结任务执行双端模型、核验输入和参数、比较数值结果并返回可审计证据。下一阶段会把真实迁移中复验过的问题整理为有证据的问题库，供 Agent 在新任务中只读参考。
+
+## 项目定位
+
+Jittor Harness 关注的是一个可复验的问题：
+
+```text
+给定一个未知 PyTorch 仓库，
+迁移 Agent 能否提交一个 Jittor candidate，
+实际运行 PyTorch 与 Jittor 两端，
+比较同一输入和同一权重下的数值结果，
+在不一致时定位首个分歧位置，
+并把修复过程记录下来。
+```
+
+## 国产化路径
+
+
+| 层次 | 当前选择 | 作用 |
+| --- | --- | --- |
+| 智能体入口 | 通用代码 Agent | 读取未知仓库，决定迁移和修复动作 |
+| 目标框架 | Jittor | 承接 PyTorch 代码与权重迁移 |
+| 验证机制 | 双端执行 + 数值轨迹 | 判断迁移结果是否可信 |
+| 后端方向 | 昇腾等国产算力 | 作为目标部署环境纳入接口设计 |
+
+当前公开实验主要验证 PyTorch 到 Jittor 的迁移和数值一致性。昇腾等国产算力的完整端到端实验会在后续后端适配中补齐。
+
+## 为什么需要 Jittor Harness
+
+普通转换器主要回答一个问题：
+
+```text
+代码能不能转过去？
+```
+
+Jittor Harness 进一步回答：
+
+```text
+迁移后的项目能不能真正运行？
+是否加载了相同权重？
+是否使用了相同输入？
+最终输出是否数值对齐？
+如果不对齐，第一次从哪一层或哪一个算子开始偏离？
+```
+
+README 中使用的核心指标如下：
+
+| 指标 | 含义 |
+| --- | --- |
+| `RN` | 迁移后的 Jittor 项目可以实际运行 |
+| `NA` | PyTorch/Jittor 最终输出通过数值对齐 |
+| `SA` | 中间层轨迹通过更严格的对齐检查 |
+| `FD` | 首次数值分歧点 |
+| `Cert` | 包含输入、权重、轨迹、误差和失败分类的数值证书 |
+
+## 快速开始
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+python -m pip install -e ".[dev]"
+```
+
+运行基础检查：
+
+```bash
+pytest tests -q
+ruff check src tests benchmarks experiments/harness
+python -m build
+```
+
+先检查一个显式任务：
+
+```bash
+PYTHONPATH=src python -m torchport inspect benchmarks/tasks/tiny/task.yaml
+```
+
+`benchmarks/tasks/tiny/task.yaml` 展示了双环境任务的完整结构，但其 Python 路径是实验机路径，
+不是跨机器默认值。复制该文件，把 `source.python`、`target.python` 和设备改为实际环境后再验收：
+
+```bash
+PYTHONPATH=src python -m torchport verify path/to/local-task.yaml \
+  --root .torchport/harness \
+  --trial t0
+```
+
+也可以把执行和判定拆开：
+
+```bash
+PYTHONPATH=src python -m torchport run task.yaml target --root .torchport/harness --trial t0
+PYTHONPATH=src python -m torchport evaluate task.yaml path/to/manifest.json \
+  --root .torchport/harness --trial t0
+PYTHONPATH=src python -m torchport inspect task.yaml
+PYTHONPATH=src python -m torchport trace task.yaml --root .torchport/harness --trial t0
+PYTHONPATH=src python -m torchport localize .torchport/harness/trace/t0.json
+```
+
+正式结果写入：
+
+```text
+.torchport/harness/verify/t0.json
+```
+
+## Workflow
+
+```text
+代码 Agent 阅读仓库并修改 candidate
+      -> 编写显式 task
+      -> PyTorch/Jittor 双端执行
+      -> 权重与输入检查
+      -> 最终输出与可选轨迹比较
+      -> 首次数值分歧定位
+      -> Agent 修复
+      -> 重复独立验收
+```
+
+TorchPort 不自动扫描并改写未知仓库。外部代码 Agent 负责仓库特有决策，TorchPort
+只接受显式任务并返回结构化证据。
+
+正式迁移的 candidate 是完整 Git 仓库。Agent 使用自己的文件、Shell、Python、测试和网络工具，
+Harness 只增加六个 TorchPort 反馈工具。结束时 Harness 保存完整仓库快照、文件 manifest 和 Git
+diff，并对冻结快照执行隐藏 `verify`；`run.py` 只是统一入口，不承载整个模型实现。
+
+## 当前状态
+
+- [x] 显式 TaskSpec、oracle 和 candidate 身份冻结
+- [x] PyTorch/Jittor 双端执行、张量证据与唯一验收结果
+- [x] 首次数值分歧定位与结构化失败分类
+- [x] CLI、Harness 和成熟代码 Agent 修复循环
+- [x] P2 反馈 Gateway、完整仓库交付、成本聚合与 tiny GPU smoke 闭环
+- [x] CamoFormer 数值验收、重复性与归约机制证据
+- [ ] 冻结 P2 正式 benchmark 并运行多 replicate 真实迁移实验
+- [ ] P3 建立有证据的迁移问题库，并在 held-out 新案例上评测经验复用
+- [ ] 冻结成熟代码 Agent 在不同 TorchPort 反馈条件下的统一对比实验
+- [ ] 扩展未见真实 PyTorch 仓库测试集
+- [ ] 完成昇腾等国产算力后端的端到端验证
+- [ ] 稳定 CLI、Harness 工具契约、文档和发布流程
+
+说明：当前公开证据主要集中在 PyTorch/Jittor 迁移与数值验证；昇腾等国产算力已经进入后端设计，但完整端到端实验仍在 TODO 中。
+
+## 目录结构
+
+```text
+src/torchport/          执行、证据采集、oracle、比较与验收核心
+experiments/harness/    反馈、预算、事件、候选仓库冻结和最终验收控制
+benchmarks/tasks/tiny/  最小双端 TaskSpec 与负例
+docs/                   架构和评测协议
+tests/                  核心与 Harness 回归测试
+```
+
+目录职责和核心/Harness 边界见
+[项目目录说明](docs/project-layout.md)。
+
+这是可独立安装和测试的最小公开版。大型数据、checkpoint、held-out 任务、真实迁移工作区和
+历史实验证据不包含在仓库中。
+
+## 开源协议
+
+Apache-2.0，见 `LICENSE`。

@@ -1,0 +1,71 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+build/
+dist/
+.venv/
+.env
+
+# 下载的模型和运行产物不进入 Git。
+artifacts/models/*
+!artifacts/models/.gitkeep
+artifacts/runs/
+artifacts/python-deps/
+artifacts/jittor-deps/
+artifacts/dist/
+artifacts/trash/
+artifacts/dsh-runs/
+
+# 本地远端工具链。
+tools/
+
+# 实验脚本缓存。
+experiments/**/__pycache__/
+experiments/p2/**/runs/
+experiments/p2/**/.preflight-cache/
+
+# 论文参考图原始下载件不进入开源仓库；保留 prompts/ref_images/README.md 中的来源说明。
+experiments/prompts/ref_images/*
+!experiments/prompts/ref_images/README.md
+
+# 本地分析/隔离产生的可恢复临时目录不进入 Git。
+.understand-anything/
+.trash/
+
+# 本机开发工具、临时运行目录和编辑器私有配置。
+.claude/settings.local.json
+.codex-build/
+.codex-finalizer/
+.pylibs/
+.tmp/
+.torchport/
+
+# CamoFormer COD pilot: freeze revisions in the materializer; keep downloaded repos and runs local.
+migrations/CamoFormer/source/
+migrations/CamoFormer/reference/
+migrations/CamoFormer/shared/
+migrations/CamoFormer/workspaces/
+migrations/CamoFormer/results/
+migrations/CamoFormer/outputs/
+migrations/CamoFormer/env.sh
+
+# 运行期进程号文件。
+*.pid
+
+# Held-out COD 迁移候选源码、权重和运行产物保存在本地。
+heldout/
+experiments/p2/heldout-v1/workspaces/*
+!experiments/p2/heldout-v1/workspaces/README.md
+experiments/p2/heldout-v1/results/plantcamo-full-r1/
+experiments/p2/heldout-v1/results/vscode-v2-none-r1/
+experiments/p2/heldout-v1/results/vscode-v2-full-r0/*.jsonl
+
+# CamoFormer 下载数据和 checkpoint 体积较大，由实验说明记录来源与摘要。
+migrations/CamoFormer/data/
+migrations/CamoFormer/checkpoint/
+
+# 仓库根不是 Node 项目；该空 lockfile 可能由误在根目录执行 npm 产生。
+/package-lock.json
