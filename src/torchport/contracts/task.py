@@ -59,6 +59,43 @@ def _input(raw: Any, base: Path) -> dict[str, Any]:
     return value
 
 
+def _train_protocol(protocol: dict[str, Any], inputs: list[Any]) -> None:
+    """train-step 需要两端同名的 optimizer 工厂与单步函数；输入第 0 维是步号。"""
+    train = protocol.get("train")
+    if not isinstance(train, dict):
+        raise ValueError("profile=train-step 需要 protocol.train 对象")
+    for key in ("optimizer", "step"):
+        if not isinstance(train.get(key), str) or not train[key]:
+            raise ValueError(f"protocol.train.{key} 必须是入口中的函数名")
+    steps = {
+        int(item["shape"][0])
+        for item in inputs
+        if isinstance(item, dict) and item.get("shape")
+    }
+    if len(steps) != 1 or min(steps) < 1:
+        raise ValueError("train-step 的每个输入第 0 维必须是相同的正步数")
+    normalized = {"optimizer": train["optimizer"], "step": train["step"]}
+    if "observe" in train:
+        observed = train["observe"]
+        if (
+            not isinstance(observed, list)
+            or not observed
+            or any(not isinstance(name, str) or not name for name in observed)
+            or len(observed) != len(set(observed))
+        ):
+            raise ValueError("protocol.train.observe 必须是非空且无重复的参数名列表")
+        normalized["observe"] = observed
+    if "sketch_dim" in train:
+        # 全参数更新量的 CountSketch 维度；与 observe 二选一
+        dim = train["sketch_dim"]
+        if isinstance(dim, bool) or not isinstance(dim, int) or dim < 1:
+            raise ValueError("protocol.train.sketch_dim 必须是正整数")
+        if "observe" in normalized:
+            raise ValueError("protocol.train.sketch_dim 与 observe 不能同时使用")
+        normalized["sketch_dim"] = dim
+    protocol["train"] = normalized
+
+
 def load_task(path: str | Path) -> dict[str, Any]:
     path = Path(path).expanduser().resolve()
     text = path.read_text(encoding="utf-8")
@@ -79,6 +116,55 @@ def normalize(raw: dict[str, Any], base: Path) -> dict[str, Any]:
     protocol = {**DEFAULT_PROTOCOL, **(raw.get("protocol") or {})}
     if int(protocol["repeats"]) < 1 or int(protocol["timeout"]) <= 0:
         raise ValueError("protocol.repeats 和 protocol.timeout 必须为正数")
+    if protocol["profile"] == "train-step":
+        _train_protocol(protocol, inputs)
+    elif protocol.get("train") is not None:
+        raise ValueError("protocol.train 只用于 profile=train-step")
+    envelope = protocol.get("train_envelope")
+    baseline = protocol.get("train_noise_baseline")
+    if envelope is not None or baseline is not None:
+        if protocol["profile"] != "train-step" or envelope != "train-repeat-envelope-v1-pilot":
+            raise ValueError("固定参考重复性包络只用于 train-step pilot")
+        if not isinstance(baseline, str) or not baseline:
+            raise ValueError("train-repeat-envelope-v1-pilot 缺少 train_noise_baseline")
+        baseline_path = Path(baseline).expanduser()
+        baseline_path = (baseline_path if baseline_path.is_absolute() else base / baseline_path).resolve()
+        if baseline_path.suffix.lower() != ".npz" or not baseline_path.is_file():
+            raise ValueError(f"固定参考重复性文件不存在：{baseline_path}")
+        baseline_hash = file_hash(baseline_path)
+        if protocol.get("train_noise_baseline_sha256") != baseline_hash:
+            raise ValueError("固定参考重复性文件 SHA256 不匹配")
+        protocol["train_noise_baseline"] = str(baseline_path)
+    elif protocol.get("train_noise_baseline_sha256") is not None:
+        raise ValueError("train_noise_baseline_sha256 缺少对应标定文件")
+    if "marginal_rerun" in protocol:
+        # 临界加跑：train-step 首次失败仅为数值超限且最大阈值使用率在 (1, upper] 时，
+        # 对同一候选补跑到 runs 次，取各次最大使用率的中位数判定
+        rerun = protocol["marginal_rerun"]
+        if protocol["profile"] != "train-step":
+            raise ValueError("protocol.marginal_rerun 只用于 profile=train-step")
+        if not isinstance(rerun, dict) or set(rerun) != {"upper", "runs"}:
+            raise ValueError("protocol.marginal_rerun 必须是只含 upper、runs 的对象")
+        upper, runs = rerun["upper"], rerun["runs"]
+        if isinstance(upper, bool) or not isinstance(upper, (int, float)) or not upper > 1:
+            raise ValueError("protocol.marginal_rerun.upper 必须大于 1")
+        if (
+            isinstance(runs, bool) or not isinstance(runs, int)
+            or runs < 3 or runs % 2 == 0 or runs <= int(protocol["repeats"])
+        ):
+            raise ValueError("protocol.marginal_rerun.runs 必须是大于 repeats 的奇数且至少为 3")
+        protocol["marginal_rerun"] = {"upper": float(upper), "runs": runs}
+    if "ignore_state" in protocol:
+        # 可由形状推出、不参与训练的 buffer（如 embeddings.position_ids），两端都不计入完整性
+        ignored = protocol["ignore_state"]
+        if (
+            not isinstance(ignored, list)
+            or not ignored
+            or any(not isinstance(name, str) or not name for name in ignored)
+            or len(ignored) != len(set(ignored))
+        ):
+            raise ValueError("protocol.ignore_state 必须是非空且无重复的状态名列表")
+        protocol["ignore_state"] = sorted(ignored)
     weights = raw.get("weights")
     if weights:
         weights = Path(weights).expanduser()

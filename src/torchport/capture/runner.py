@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import sys
 import time
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -37,9 +38,26 @@ from .tracing import (
     func_scopes,
     run_isolated_modules,
 )
+from .training import calibrate_steps, enable_determinism, run_steps
 from .variants import _unbatch, _variant_inputs, apply_variant
 
 MODES = ("normal", "trace", "layers")
+
+
+class TraceSizeError(ValueError):
+    def __init__(self, estimated: int, limit: int) -> None:
+        self.estimated = estimated
+        self.limit = limit
+        super().__init__(f"trace 预计写入 {estimated} bytes，超过上限 {limit} bytes")
+
+
+def check_trace_size(archives: list[dict[str, np.ndarray]], limit: int) -> int:
+    """在任何 trace NPZ 写入前估算未压缩 ZIP 体积。"""
+    estimated = sum(np.asarray(value).nbytes + 1024 for archive in archives for value in archive.values())
+    estimated += 16 * 1024 * 1024
+    if estimated > limit:
+        raise TraceSizeError(estimated, limit)
+    return estimated
 
 
 def _digest(values: dict[str, np.ndarray]) -> str:
@@ -101,6 +119,61 @@ def _call_model(model: Any, args: list[Any], kwargs: dict[str, Any], kind: str) 
     return model(*args, **kwargs)
 
 
+def _train_steps(inputs: list[dict[str, Any]]) -> int:
+    steps = {int((spec.get("shape") or [0])[0]) for spec in inputs}
+    if len(steps) != 1 or min(steps) < 1:
+        raise ValueError("train-step 的每个输入第 0 维必须是相同的正步数")
+    return steps.pop()
+
+
+def _capture_train(
+    job: dict[str, Any],
+    model: Any,
+    scope: dict[str, Any],
+    arrays: dict[str, np.ndarray],
+    state: dict[str, Any],
+    state_path: Path,
+    checkpoint: Any,
+    framework: dict[str, Any],
+    device: str,
+    fresh_source: bool,
+) -> dict[str, Any]:
+    """训练步采集：只在冻结 source 首次运行时额外生成 fp64/alt 噪声标定。"""
+    kind, out, train = job["kind"], Path(job["out_dir"]), job["train"]
+    steps = _train_steps(job["inputs"])
+    calibrate = kind == "source" and fresh_source and bool(job.get("calibrate"))
+    initial = deepcopy(model) if calibrate else None
+    outputs, info = run_steps(model, kind, device, scope, train, arrays, job["inputs"], steps)
+    if kind == "source" and fresh_source:
+        np.savez(out / "inputs.npz", **arrays)
+    np.savez(out / "outputs.npz", **arrays, **outputs)
+    if calibrate:
+        fp64, alt = calibrate_steps(
+            initial, device, scope, train, arrays, job["inputs"], steps, job["seed"]
+        )
+        np.savez(out / "train_fp64.npz", **fp64)
+        np.savez(out / "train_alt.npz", **alt)
+    report = {
+        "kind": kind,
+        "mode": "normal",
+        "framework": framework,
+        "numpy": np.__version__,
+        "weights": state["total"],
+        "loaded": state["loaded"],
+        "state": state,
+        "checkpoint": checkpoint,
+        "outputs": sorted(outputs),
+        "hashes": {
+            "input": _digest(arrays),
+            "output": _digest(outputs),
+            "state": file_hash(state_path) if kind == "source" else None,
+        },
+        "train": {**info, "calibrated": calibrate},
+    }
+    write_json(out / "capture.json", report)
+    return report
+
+
 def capture(job: dict[str, Any]) -> dict[str, Any]:
     """job: kind/side/inputs/seed/mode/out_dir，以及 oracle 或 source weights。
 
@@ -114,6 +187,11 @@ def capture(job: dict[str, Any]) -> dict[str, Any]:
     out = Path(job["out_dir"])
     root = Path(side["repo"])
     device = side.get("device", "cpu")
+    if job.get("train"):
+        if mode != "normal" or job.get("performance") or job.get("variant"):
+            raise ValueError("train-step 只支持 mode=normal，不支持性能测量和变体")
+        # 必须在任何 CUDA 工作之前开启
+        enable_determinism(kind)
     framework = _framework(kind, job["seed"], device)
     _check_bridge(kind)
     original = list(sys.path)
@@ -123,37 +201,55 @@ def capture(job: dict[str, Any]) -> dict[str, Any]:
         model = load_model(scope, side["model"], kind, side["args"], side["kwargs"])
     finally:
         sys.path[:] = original
-    model.eval()
+    # train-step 不进 eval：Jittor 的 eval() 会对全部参数 stop_grad，train() 不能可靠恢复，
+    # 冻结状态必须保持模型构造时的样子，否则可训练参数集合被采集流程本身改写。
+    if not job.get("train"):
+        model.eval()
     if kind == "source" and device == "cuda":
         model.cuda()
 
     oracle = Path(job["oracle"]) if job.get("oracle") else None
+    ignore = tuple(job.get("ignore_state") or ())
     state_path = out / "state.npz"
     if kind == "source":
         if oracle is not None:
             with np.load(oracle / "inputs.npz", allow_pickle=False) as archive:
                 arrays = {name: np.asarray(archive[name]) for name in archive.files}
             state_path = oracle / "state.npz"
-            state = load_state(model, state_path, kind="source")
+            state = load_state(model, state_path, kind="source", ignore=ignore)
             oracle_meta = read_json(oracle / "oracle.json")
             checkpoint = (oracle_meta.get("capture") or {}).get("checkpoint")
         else:
             weights = job.get("weights")
             checkpoint = (
-                load_checkpoint(model, Path(weights))
+                load_checkpoint(model, Path(weights), ignore)
                 if weights
                 else {"requested": False, "complete": True}
             )
             arrays = make_data(job["inputs"], job["seed"])
-            total = save_state(model, state_path)
+            total = save_state(model, state_path, ignore)
             state = {"total": total, "loaded": total, "missing": [], "value_mismatch": []}
     else:
         if oracle is None:
             raise ValueError("target 端缺少 oracle")
         with np.load(oracle / "inputs.npz", allow_pickle=False) as archive:
             arrays = {name: np.asarray(archive[name]) for name in archive.files}
-        state = load_state(model, oracle / "state.npz")
+        state = load_state(model, oracle / "state.npz", ignore=ignore)
         checkpoint = None
+
+    if job.get("train"):
+        return _capture_train(
+            job,
+            model,
+            scope,
+            arrays,
+            state,
+            state_path,
+            checkpoint,
+            framework,
+            device,
+            fresh_source=kind == "source" and oracle is None,
+        )
 
     if job.get("variant") and kind != "source":
         raise ValueError("合法变体只施加在 source 端")
@@ -254,13 +350,28 @@ def capture(job: dict[str, Any]) -> dict[str, Any]:
     outputs = to_arrays(result, kind, "output")
     if not outputs:
         raise ValueError("模型输出中没有张量")
+    calibration = None
+    fp64_values: dict[str, np.ndarray] = {}
+    alt_values: dict[str, np.ndarray] = {}
+    repeat_values: dict[str, np.ndarray] = {}
+    if kind == "source" and mode == "trace":
+        _mark_leaves(module_calls)
+        fp64_values, alt_values, repeat_values, calibration = calibrate_source_modules(
+            model, module_calls, module_inputs, device
+        )
+    stored_trace = sketch_layers(trace_values) if mode == "trace" and focus is not None else trace_values
+    if mode == "trace" and job.get("trace_max_bytes") is not None:
+        # np.savez stores arrays without compression. Allow generous ZIP headers and metadata.
+        archives = [arrays, outputs, stored_trace, isolated_values, isolated_repeats]
+        if kind == "source":
+            archives.extend((fp64_values, alt_values, repeat_values, module_values, module_inputs))
+        check_trace_size(archives, int(job["trace_max_bytes"]))
     if kind == "source" and oracle is None:
         np.savez(out / "inputs.npz", **arrays)
     np.savez(out / "outputs.npz", **arrays, **outputs)
     if trace_values:
         # 聚焦 trace 中的容器模块仍可输出数千万元素；大张量只保留
         # CountSketch 供 L2 证据使用，小张量仍逐元素保留。全量 trace 不改。
-        stored_trace = sketch_layers(trace_values) if focus is not None else trace_values
         np.savez(out / "trace.npz", **stored_trace)
     if mode == "layers":
         # 最终输出也进入 E1：中间层可以因命名不同而只报告，output.* 必须参与判定。
@@ -270,12 +381,7 @@ def capture(job: dict[str, Any]) -> dict[str, Any]:
         # v3 的输出逐元素比较：output.* 不压缩
         exact = {name for name in layers if job.get("exact_outputs") and _is_output_name(name)}
         np.savez(out / "layers.npz", **sketch_layers(layers, keep=exact))
-    calibration = None
     if kind == "source" and mode == "trace":
-        _mark_leaves(module_calls)
-        fp64_values, alt_values, repeat_values, calibration = calibrate_source_modules(
-            model, module_calls, module_inputs, device
-        )
         np.savez(out / "module_fp64.npz", **fp64_values)
         np.savez(out / "module_alt.npz", **alt_values)
         np.savez(out / "module_repeat.npz", **repeat_values)
@@ -332,5 +438,20 @@ def capture(job: dict[str, Any]) -> dict[str, Any]:
 
 
 def main(job_path: str) -> int:
-    capture(read_json(Path(job_path)))
+    from .training import ContractError
+
+    job = read_json(Path(job_path))
+    try:
+        capture(job)
+    except TraceSizeError as exc:
+        write_json(Path(job["out_dir"]) / "contract.json", {
+            "code": "TRACE_TOO_LARGE", "message": str(exc),
+            "estimated_bytes": exc.estimated, "limit_bytes": exc.limit,
+        })
+        raise
+    except ContractError as exc:
+        # 接口契约错误单独落盘：它是 Harness 读取任务契约时的失败，Agent 本地无法复现，
+        # 由 run manifest 带回，供 diagnostic 返回冻结的枚举文本
+        write_json(Path(job["out_dir"]) / "contract.json", exc.as_dict())
+        raise
     return 0

@@ -89,6 +89,63 @@ def _failed_report() -> dict:
 
 
 class GatewayTests(unittest.TestCase):
+    def test_two_tasks_share_candidate_and_both_gate_verify(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            gateway, target = _fixture(root, FeedbackLevel.LOCALIZED)
+            second = root / "training.json"
+            task = json.loads(gateway.task_path.read_text("utf-8"))
+            task["task_id"] = "training"
+            second.write_text(json.dumps(task), encoding="utf-8")
+            paired = HarnessGateway(
+                {"inference": gateway.task_path, "training": second},
+                root / "paired-evidence", root / "paired-trial",
+                TrialProtocol(FeedbackLevel.LOCALIZED, 2, 60),
+            )
+            passed = {**_failed_report(), "passed": True}
+            with patch("experiments.harness.gateway.verify", side_effect=[passed, _failed_report()]):
+                response = paired.call("verify")
+
+        self.assertFalse(response["data"]["passed"])
+        self.assertTrue(response["data"]["tasks"]["inference"]["passed"])
+        self.assertFalse(response["data"]["tasks"]["training"]["passed"])
+        self.assertEqual(response["budget"]["oracle_queries"], 1)
+        self.assertEqual(Path(target).name, "target")
+
+    def test_none_schema_has_task_selector_but_no_localization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            gateway, _ = _fixture(root, FeedbackLevel.DIAGNOSTIC)
+            second = root / "second.json"
+            second.write_text(gateway.task_path.read_text("utf-8"), encoding="utf-8")
+            paired = HarnessGateway(
+                {"inference": gateway.task_path, "training": second},
+                root / "e2", root / "t2", TrialProtocol(FeedbackLevel.DIAGNOSTIC, 2, 60),
+            )
+            schemas = {item["name"]: item for item in paired.tool_schemas()}
+
+        self.assertNotIn("trace", schemas)
+        self.assertNotIn("localize", schemas)
+        self.assertEqual(schemas["run"]["parameters"]["properties"]["task"]["enum"],
+                         ["inference", "training"])
+
+    def test_restart_restores_query_budget_and_call_sequence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            gateway, _ = _fixture(root, FeedbackLevel.DIAGNOSTIC, queries=1)
+            with patch("experiments.harness.gateway.verify", return_value=_failed_report()):
+                first = gateway.call("verify")
+            resumed = HarnessGateway(
+                gateway.task_path, root / "evidence", root / "trial",
+                TrialProtocol(FeedbackLevel.DIAGNOSTIC, 1, 60),
+            )
+            second = resumed.call("verify")
+
+        self.assertTrue(first["ok"])
+        self.assertFalse(second["ok"])
+        self.assertEqual(resumed.calls, 2)
+        self.assertEqual(second["budget"]["oracle_queries"], 1)
+
     def test_exposes_only_torchport_tools(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             gateway, _ = _fixture(Path(temporary), FeedbackLevel.LOCALIZED)
@@ -150,6 +207,19 @@ class GatewayTests(unittest.TestCase):
             self.assertNotIn(secret, serialized)
         self.assertEqual(tuple(response["data"]), DIAGNOSTIC_FIELDS)
 
+    def test_localized_keeps_divergence_but_not_controller_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            gateway, _ = _fixture(Path(temporary), FeedbackLevel.LOCALIZED)
+            report = {**_failed_report(), "oracle": "/private/oracle",
+                      "artifacts": {"report": "/private/report"}}
+            with patch("experiments.harness.gateway.verify", return_value=report):
+                response = gateway.call("verify")
+
+        serialized = json.dumps(response["data"])
+        self.assertNotIn("/private", serialized)
+        self.assertNotIn("edit model.py", serialized)
+        self.assertIn("encoder.layer3", serialized)
+
     def test_trace_is_only_available_for_localized_feedback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             gateway, _ = _fixture(Path(temporary), FeedbackLevel.DIAGNOSTIC)
@@ -158,6 +228,48 @@ class GatewayTests(unittest.TestCase):
 
         self.assertNotIn("trace", names)
         self.assertFalse(response["ok"])
+        self.assertEqual(response["budget"]["oracle_queries"], 0)
+
+    def test_trace_before_verify_is_contract_error_without_query(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            gateway, _ = _fixture(Path(temporary), FeedbackLevel.LOCALIZED)
+            response = gateway.call("trace")
+        self.assertFalse(response["ok"])
+        self.assertIn("请先运行 verify", response["error"]["message"])
+        self.assertEqual(response["budget"]["oracle_queries"], 0)
+
+    def test_failed_verify_dispatch_does_not_unlock_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            gateway, _ = _fixture(Path(temporary), FeedbackLevel.LOCALIZED)
+            with patch("experiments.harness.gateway.verify", side_effect=RuntimeError("service failed")):
+                verified = gateway.call("verify")
+            traced = gateway.call("trace")
+        self.assertFalse(verified["ok"])
+        self.assertFalse(traced["ok"])
+        self.assertIn("请先运行 verify", traced["error"]["message"])
+        self.assertEqual(traced["budget"]["logical_query_cost"]["by_tool"]["trace"], 0)
+
+    def test_trace_hidden_and_not_charged_without_inference_task(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            gateway, _ = _fixture(Path(temporary), FeedbackLevel.LOCALIZED)
+            with patch.object(HarnessGateway, "_traceable", return_value=False):
+                names = {tool["name"] for tool in gateway.tool_schemas()}
+                traced = gateway.call("trace")
+                localized = gateway.call("localize")
+
+        self.assertTrue({"trace", "localize"}.isdisjoint(names))
+        self.assertFalse(traced["ok"])
+        self.assertIn("没有支持 trace", traced["error"]["message"])
+        self.assertFalse(localized["ok"])
+        self.assertEqual(localized["budget"]["oracle_queries"], 0)
+
+    def test_evaluate_without_run_is_not_charged(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            gateway, _ = _fixture(Path(temporary), FeedbackLevel.DIAGNOSTIC)
+            response = gateway.call("evaluate")
+
+        self.assertFalse(response["ok"])
+        self.assertIn("没有可评估的 run_id", response["error"]["message"])
         self.assertEqual(response["budget"]["oracle_queries"], 0)
 
     def test_oracle_query_budget_cannot_be_exceeded(self) -> None:
@@ -195,6 +307,35 @@ class GatewayTests(unittest.TestCase):
             self.assertNotEqual(snapshot, target)
             self.assertEqual((snapshot / "main.py").read_text("utf-8"), "VALUE = 0\n")
             self.assertTrue(Path(result["candidate_delivery"]["manifest"]).is_file())
+
+    def test_scope_violation_invalidates_trial_even_if_verify_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            gateway, _ = _fixture(Path(temporary), candidate_entry="run.py")
+            report = {**_failed_report(), "passed": True}
+            with patch("experiments.harness.gateway.verify", return_value=report):
+                result = gateway.certify("scope_violation")
+
+        self.assertTrue(result["passed"])
+        self.assertFalse(result["valid"])
+        self.assertFalse(result["success"])
+
+    def test_pilot_only_never_claims_valid_formal_trial(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base, _ = _fixture(root, candidate_entry="run.py")
+            pilot = HarnessGateway(
+                base.task_path, root / "pilot-evidence", root / "pilot-trial",
+                TrialProtocol(FeedbackLevel.VERDICT, 2, 60),
+                metadata={"claim_status": "pilot_only"},
+            )
+            report = {**_failed_report(), "passed": True}
+            with patch("experiments.harness.gateway.verify", return_value=report):
+                result = pilot.certify("agent_completed")
+
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["claim_status"], "pilot_only")
+        self.assertFalse(result["valid"])
+        self.assertFalse(result["success"])
 
 
 if __name__ == "__main__":

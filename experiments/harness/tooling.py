@@ -31,23 +31,41 @@ def _tool(
     }
 
 
-def tool_schemas(protocol: TrialProtocol) -> list[dict[str, Any]]:
-    """只返回 TorchPort 能力；文件、Shell、Git 和网络由代码 Agent 自己提供。"""
+def tool_schemas(
+    protocol: TrialProtocol, task_names: tuple[str, ...] = (), *, traceable: bool = True
+) -> list[dict[str, Any]]:
+    """只返回 TorchPort 能力；文件、Shell、Git 和网络由代码 Agent 自己提供。
+
+    traceable=False（没有支持 trace 的推理任务）时不暴露 trace/localize，避免必然失败的查询。
+    """
     tools = [
-        _tool("inspect", "查看公开 TaskSpec，不读取 oracle", {}),
+        _tool("inspect", "查看任务契约", {}),
         _tool("run", "运行当前 target candidate", {}),
         _tool("evaluate", "评估最近一次 run", {"run_id": "string"}),
         _tool("verify", "按开发协议重复验证当前 candidate", {}),
         _tool("trace", "采集双端 trace", {}),
         _tool("localize", "定位最近一次 trace 的首次分歧", {}),
     ]
-    if protocol.feedback != FeedbackLevel.LOCALIZED:
+    if task_names:
+        selector = {"type": "string", "enum": list(task_names)}
+        for item in tools:
+            if item["name"] in {"run", "evaluate"}:
+                item["parameters"]["properties"]["task"] = selector
+    if protocol.feedback != FeedbackLevel.LOCALIZED or not traceable:
         tools = [tool for tool in tools if tool["name"] not in LOCALIZED_TOOLS]
     return tools
 
 
-def validate_call(protocol: TrialProtocol, tool: str, arguments: dict[str, Any]) -> None:
-    schemas = {item["name"]: item["parameters"] for item in tool_schemas(protocol)}
+def validate_call(
+    protocol: TrialProtocol, tool: str, arguments: dict[str, Any], task_names: tuple[str, ...] = (),
+    *, traceable: bool = True,
+) -> None:
+    schemas = {
+        item["name"]: item["parameters"]
+        for item in tool_schemas(protocol, task_names, traceable=traceable)
+    }
+    if tool in LOCALIZED_TOOLS and protocol.feedback == FeedbackLevel.LOCALIZED and not traceable:
+        raise PermissionError(f"工具 {tool} 在本任务中不可用：没有支持 trace 的推理任务")
     if tool not in schemas:
         raise PermissionError(f"工具在 {protocol.feedback.value} 条件中不可用：{tool}")
     schema = schemas[tool]

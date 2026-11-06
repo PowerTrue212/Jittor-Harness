@@ -180,21 +180,42 @@ diff，并对冻结快照执行隐藏 `verify`；`run.py` 只是统一入口，�
 
 说明：当前公开证据主要集中在 PyTorch/Jittor 迁移与数值验证；昇腾等国产算力已经进入后端设计，但完整端到端实验仍在 TODO 中。
 
+## 当前实验材料
+
+- `experiments/p2/`：内部实验运行记录，未包含在本公开仓库中。
+- `experiments/figures/fig_e1_ratio/`：E1 噪声标定比值。
+- `experiments/figures/fig_fixed_tolerance/`：固定容差、运行波动和误差放大。
+- `experiments/figures/fig_jittor_atomic/`：Jittor 归约不确定性的机制证据。
+
 ## 目录结构
 
 ```text
-src/torchport/          执行、证据采集、oracle、比较与验收核心
-experiments/harness/    反馈、预算、事件、候选仓库冻结和最终验收控制
-benchmarks/tasks/tiny/  最小双端 TaskSpec 与负例
-docs/                   架构和评测协议
-tests/                  核心与 Harness 回归测试
+src/torchport/          可信执行、证据采集、oracle、比较与验收核心
+benchmarks/             小型仓库、任务定义与入口发现基准
+compatibility/          历史兼容性规则与有证据的迁移问题
+experiments/            实验协议、数据、图表、提示词和报告
+migrations/             真实仓库迁移协议、本地工作区和仓库专用证据
+scripts/                安装、复现和远程开发工具
+docs/                   架构、实施计划和开发说明
+tests/                  单元测试与集成测试
 ```
 
-目录职责和核心/Harness 边界见
+完整的目录职责、生成物归属和两个 Python 包的边界见
 [项目目录说明](docs/project-layout.md)。
 
-这是可独立安装和测试的最小公开版。大型数据、checkpoint、held-out 任务、真实迁移工作区和
-历史实验证据不包含在仓库中。
+## 复现实验图
+
+```bash
+python experiments/figures/fig_e1_ratio/plot.py
+python experiments/figures/fig_fixed_tolerance/plot.py
+python experiments/figures/fig_jittor_atomic/plot.py
+```
+
+架构图提示词：
+
+```text
+experiments/prompts/architecture.md
+```
 
 ## 开源协议
 

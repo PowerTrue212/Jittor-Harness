@@ -26,14 +26,31 @@ P2 只回答一个问题：在相同 Agent、任务、初始 candidate、硬件�
 | `structural/weight_load/aligned/strict_aligned` | 否 | 是 | 是 |
 | `scope/invocation/operator/first_divergence` | 否 | 否 | 是 |
 | 输入/输出证据与 `error_jump` | 否 | 否 | 是 |
+| `contract`（接口契约错误，固定枚举文本） | 否 | 是 | 是 |
 
 `diagnostic` 使用代码中的固定 allowlist，不返回自由文本 `summary`、`problems` 或 `next`，
 也不返回 module、file、line、operator、张量名称或首次分歧。失败码必须归一到通用类别，
 例如 `NUMERICAL_MISMATCH`，不能把定位信息编码进失败原因。
 
+例外是接口契约错误（2026-10-28，feedback schema v2）：Harness 自身的适配代码在读取任务契约
+（训练函数、optimizer 的 `param_groups`/`lr`、loss 的形状与类型）时失败，失败码为 `CONTRACT_ERROR`，
+`contract` 字段给出 `{code, message}`，`message` 只能取代码中冻结的枚举文本，描述接口约定本身，
+不含模块、算子、张量名或数值位置。这类错误由 Harness 抛出，Agent 在本地无法复现，若只返回
+`RUN_FAILED` 会让 trial 测的是“猜中接口约定”而不是迁移能力；因此 diagnostic 与 localized 都返回它。
+
 Agent 使用成熟代码环境自带的文件浏览、搜索、编辑、Shell、Python、Git、测试和公开网络检索。
 Harness 不重写这些能力，只增加 `inspect`、`run`、`evaluate`、`verify`、`trace`、`localize`
-六个 TorchPort 工具。`trace` 和 `localize` 只在 localized 条件出现。最终认证入口不注册为
+六个 TorchPort 工具。`trace` 和 `localize` 只在 localized 条件出现；trace 目前只支持推理任务，
+trial 的任务全是 `train-step` 时这两个工具不向 Agent 暴露（2026-11-02 起，此前 trial 原样保留）。
+此时 localized 与 diagnostic 的差别只剩 evaluate/verify 反馈中的首次分歧等定位字段。
+trace 只做聚焦采集（2026-11-04 起）：必须先有同一 trial 的 verify 报告且其中有首次分歧或临界位置，
+trace 才只记录该位置之前 8 个张量所属的模块。此前没有 verify 报告时会退回全量逐层记录，RAFT 20 次
+迭代的全量 trace 单次写出 20 GB 以上，两次把 50 GB 数据盘写满（raft-wf-full-r3/r4，记为基础设施
+失败，原记录保留）。现在：trial 内从未调用 verify 时，Gateway 在派发前拒绝 trace（不计 query）；
+已 verify 但报告里没有可聚焦的位置（例如已通过）时，trace 不启动任何进程，返回 `TRACE_NO_FOCUS`
+（到达验证服务，按下条规则计 query，物理成本为 0）。聚焦采集在写入 NPZ 前按数组原始字节数及容器开销
+估算本端 trace 产物；估算超过 4 GiB 时拒绝写入，返回 `TRACE_TOO_LARGE`，不继续运行另一端。
+这个上限约束单次采集写入量，不包含已经冻结的 oracle。最终认证入口不注册为
 Agent tool，隐藏 TaskSpec、oracle 和 evaluator 也不在 candidate 工作区内。
 
 Agent 在迁移前自行检查依赖、运行设备、显存、内存、磁盘、数据和 checkpoint，并决定是否安装、
@@ -72,7 +89,9 @@ experiments/p2/runs/<experiment>/<task>/<condition>/<trial>/
 artifact，以及 provider 返回的原始 usage。聚合器不得覆盖或删掉失败尝试。
 
 一次 `evaluate`、`verify` 或 `trace` 请求记为一个 logical oracle query；`inspect`、`run`
-和对已有 trace 的确定性 `localize` 不计。重复查询同一 candidate 仍计数，同时另记
+和对已有 trace 的确定性 `localize` 不计。执行前即可判定必然失败的调用（工具在本条件不可用、
+参数不合法、`evaluate` 没有可评估的 run）不计；已到达验证服务后被拒绝的调用（如产物与当前
+candidate 不符）仍计数。重复查询同一 candidate 仍计数，同时另记
 唯一 candidate query 数量。trial 同时受 oracle query 和 wall time 限制，先到者停止。
 
 Logical Query Cost 与 Physical Evaluation Cost 分开保存，不能互相替代：
@@ -190,9 +209,18 @@ PyTorch 使用 CUDA synchronize；Jittor 使用等价的全局同步。计时边
 统计框架。
 
 正式实验还必须由外部隔离 worker 生成 attestation。controller 只校验并冻结该证据；
-它不把 JSON 声明当作隔离实现。attestation 至少证明网络和宿主文件系统隔离、candidate
+它不把 JSON 声明当作隔离实现。attestation 至少证明宿主文件系统与凭据隔离、candidate
 是唯一可写挂载、source 与冻结输入只读、隐藏验收材料未挂载给 Agent，并记录 runtime 与
 不可变 image digest。缺失任一条件时不得生成正式 run-plan。
+正式实验的 attestation 还必须证明：Agent 看不到 Harness/TorchPort 控制代码、人工迁移
+校准实现和其他 candidate 工作区；每个条件从新会话启动，不挂载先前 trial 的历史或持久记忆，
+也无法通过会话工具访问其他 trial。
+公开网络、网页搜索和远程代码搜索保持可用，两组使用相同的普通工具配置，并冻结工具清单摘要。
+公开同题实现可以被 Agent 检索和引用；记录 URL、版本或提交号，结论解释为通用 Agent 在公开
+检索条件下的迁移效果。外部适配层保存网页和代码搜索事件；这些普通工具调用不计入 TorchPort
+Logical Query Cost。公开参考的使用情况单独汇报，不使 trial 无效。
+这些字段由 worker 对实际可见挂载和会话配置生成，不能由实验作者手填 `true` 代替隔离。
+prompt 中的访问规则用于指导 Agent；正式隔离以 worker 实际执行的边界为准。
 
 ## 首轮环境验收
 

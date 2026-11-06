@@ -23,19 +23,26 @@ Jittor Harness 是项目的对外名称，`torchport` 是其内部验证包和 C
 | --- | --- |
 | `tests/` | 核心契约、进程生命周期、采集、比较和负例测试 |
 | `benchmarks/tasks/` | 公开、显式、可复现的 TaskSpec 与小型双端 fixture |
+| `compatibility/` | P3 的历史兼容性规则、迁移问题条目和已验证修复证据 |
+| `experiments/` | 汇总数据、绘图代码、报告和可复现实验记录 |
 | `experiments/harness/candidate.py` | 冻结完整候选仓库、文件 manifest 和 Git diff |
 | `experiments/harness/orchestration/` | 实验校验、冻结 run plan、attempt 和基础设施重试 |
 | `experiments/harness/reporting/` | 只读结果聚合与性能测量 |
 | `experiments/harness/` | 成熟 Agent 的 P2 Gateway、反馈策略、预算、事件和最终认证 |
-| `docs/` | 架构和评测协议 |
+| `scripts/remote/torchport_remote/` | 远端配置、bundle、传输、反馈和命令编排 |
+| `migrations/` | 真实仓库迁移协议、本地工作区和仓库专用证据 |
+| `deliverables/` | 面向交付的报告与演示文稿 |
+| `scripts/` | 安装、复现和远程开发工具 |
+| `docs/` | 架构、路线图和开发说明 |
 
 ## 本地产物
 
 `.venv/`、`.tmp/`、`.torchport/`、`.codex-build/`、`.codex-finalizer/`、缓存、权重和
-实验工作区都是可重建或机器相关的内容，由 `.gitignore` 排除。
+实验工作区都是可重建或机器相关的内容，由 `.gitignore` 排除。需要长期保留的实验
+结论应提炼到对应的 `experiments/p2/<study>/` 或 `deliverables/`。
 
 ## 控制代码体积
 
 新增命令只能组合现有 contracts、runtime、capture、comparison、verification 和 diagnosis 能力。
-性能与成本信息扩展现有 manifest/result，不新建另一套运行器。模型特例进入 task runner；
-迁移策略留给 Agent。
+性能与成本信息扩展现有 manifest/result，不新建另一套运行器。模型特例进入 task
+runner；实验统计进入 `experiments/`；迁移策略留给 Agent。

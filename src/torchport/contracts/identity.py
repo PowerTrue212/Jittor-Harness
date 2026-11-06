@@ -16,10 +16,14 @@ def digest(value: Any) -> str:
 
 # 证据采集语义的版本。capture 的改动若会改变已记录的数值（例如 2026-10-09 修复 hook 记录与
 # 原地运算共享内存），必须递增，使旧 oracle/envelope 失效重建。
-CAPTURE_VERSION = 2
+CAPTURE_VERSION = 4
 # 只影响判定、不影响 source 证据的协议参数；调整它们不应使 oracle/envelope 失效重建。
 # 实际取值仍完整写入每份 verify 报告。
-JUDGE_KEYS = ("pass_k", "floor_k", "noise_floor", "noise_probe")
+JUDGE_KEYS = (
+    "pass_k", "floor_k", "noise_floor", "noise_probe",
+    "train_envelope", "train_noise_baseline", "train_noise_baseline_sha256",
+    "marginal_rerun",
+)
 
 
 def oracle_key(task: dict[str, Any]) -> str:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -12,6 +13,7 @@ from torchport.contracts import SKIP_DIRS, digest, file_hash
 from torchport.runtime import write_json
 
 DELIVERY_SKIP_DIRS = set(SKIP_DIRS) | {".git"}
+DELIVERY_SKIP_ROOT_DIRS = {".scratch"}
 SENSITIVE_NAMES = {".env", "id_dsa", "id_ecdsa", "id_ed25519", "id_rsa"}
 
 
@@ -20,7 +22,7 @@ def _walk(root: Path):
         base = Path(directory)
         child_directories = []
         for name in sorted(names):
-            if name in DELIVERY_SKIP_DIRS:
+            if name in DELIVERY_SKIP_DIRS or (base == root and name in DELIVERY_SKIP_ROOT_DIRS):
                 continue
             path = base / name
             if path.is_symlink():
@@ -123,11 +125,15 @@ def initialize_git_workspace(root: str | Path) -> bool:
 def _git_evidence(root: Path, output: Path) -> dict[str, Any]:
     if not (root / ".git").exists():
         return {"available": False, "reason": "candidate workspace has no Git baseline"}
-    status = _git(root, "status", "--short", "--untracked-files=all")
+    scratch_exclude = ":(exclude).scratch"
+    status = _git(root, "status", "--short", "--untracked-files=all", "--", ".", scratch_exclude)
     index_path = output / ".candidate-index"
     git_env = os.environ.copy()
     git_env["GIT_INDEX_FILE"] = str(index_path)
     read_tree = _git(root, "read-tree", "HEAD", env=git_env)
+    # An explicit negative pathspec makes `git add` reject an ignored .scratch
+    # directory on Windows. Add to the temporary index, then exclude it from
+    # the evidence diff below; the real repository index is never changed.
     add = _git(root, "add", "-A", "--", ".", env=git_env)
     diff = _git(
         root,
@@ -138,6 +144,7 @@ def _git_evidence(root: Path, output: Path) -> dict[str, Any]:
         "HEAD",
         "--",
         ".",
+        scratch_exclude,
         env=git_env,
     )
     index_path.unlink(missing_ok=True)
@@ -170,6 +177,7 @@ def finalize_candidate(
     output: str | Path,
     *,
     required_entry: str | None = None,
+    resume_existing: bool = False,
 ) -> dict[str, Any]:
     """Freeze a clean repository snapshot and its review evidence before official verify."""
     root = Path(root).resolve()
@@ -192,7 +200,21 @@ def finalize_candidate(
 
     snapshot = output / "repository"
     if snapshot.exists():
-        raise FileExistsError(f"candidate snapshot 已存在：{snapshot}")
+        if not resume_existing:
+            raise FileExistsError(f"candidate snapshot 已存在：{snapshot}")
+        manifest_path = output / "candidate-manifest.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"已有快照缺少 manifest：{manifest_path}")
+        report = json.loads(manifest_path.read_text(encoding="utf-8"))
+        after = repository_manifest(snapshot)
+        if (report.get("snapshot") != str(snapshot)
+                or report.get("required_entry") != required_entry
+                or report.get("content_digest") != before["content_digest"]
+                or report.get("content_digest") != after["content_digest"]):
+            raise ValueError("已有快照与当前候选或 manifest 不一致")
+        report["manifest"] = str(manifest_path)
+        report["manifest_sha256"] = file_hash(manifest_path)
+        return report
     shutil.copytree(
         root,
         snapshot,
@@ -201,6 +223,7 @@ def finalize_candidate(
             name
             for name in names
             if name in DELIVERY_SKIP_DIRS
+            or (Path(_directory) == root and name in DELIVERY_SKIP_ROOT_DIRS)
         ],
     )
     after = repository_manifest(snapshot)

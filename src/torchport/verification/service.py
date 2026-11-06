@@ -5,12 +5,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from ..comparison import (
     ENVELOPE_V3,
     called_modules,
     compare_envelope,
     compare_envelope_v3,
     compare_module_config,
+    compare_noise_calibrated,
     compare_tensor_archives,
 )
 from ..runtime import (
@@ -23,7 +26,7 @@ from ..runtime import (
 from .judge import judge, judge_repeats
 from .noise import calibrate as calibrate_noise
 from .oracle import build_oracle
-from .runner import run_side
+from .runner import TRAIN_STEP, run_side
 
 
 def evaluate(
@@ -55,12 +58,75 @@ def evaluate(
         result["stderr_tail"] = tail
         result["timeout"] = execution.get("timeout")
         result["run_id"] = run.get("run_id")
+        contract = run.get("contract")
+        if isinstance(contract, dict) and contract.get("code"):
+            # Harness 读取任务契约失败：不是候选代码的运行错误，单独标出
+            result["failure_code"] = "CONTRACT_ERROR"
+            result["contract"] = {"code": contract["code"], "message": contract.get("message")}
+            result["summary"] = f"CONTRACT_ERROR: {contract.get('message')}"
         return result
     reference = Path(oracle["dir"]) / "outputs.npz"
     candidate_path = Path(run["artifacts"]["outputs"])
+    if protocol["profile"] == TRAIN_STEP:
+        return _evaluate_train(oracle, run, protocol, reference, candidate_path)
     fp32 = compare_tensor_archives(reference, candidate_path, profile=protocol["profile"])
     strict = compare_tensor_archives(reference, candidate_path, profile="operator-strict")
     result = judge(oracle["capture"], run["capture"], fp32, strict, protocol)
+    result["run_id"] = run["run_id"]
+    result["candidate_identity"] = run["side_identity"]
+    result["artifacts"] = {"reference": str(reference), "candidate": str(candidate_path)}
+    return result
+
+
+def _exact_train_checks(source: dict[str, Any], target: dict[str, Any]) -> list[dict[str, Any]]:
+    """train-step 中必须逐项相同的离散事实：可训练参数集合、步数和每步学习率。"""
+    failures = []
+    for key, reason in (
+        ("trainable", "可训练参数集合不同"),
+        ("steps", "训练步数不同"),
+        ("lr", "学习率调度不同"),
+        ("observed", "训练观察参数集合不同"),
+    ):
+        if source.get(key) != target.get(key):
+            failures.append({"name": f"train.{key}", "reason": reason})
+    return failures
+
+
+def _evaluate_train(
+    oracle: dict[str, Any],
+    run: dict[str, Any],
+    protocol: dict[str, Any],
+    reference: Path,
+    candidate_path: Path,
+) -> dict[str, Any]:
+    """train-step：结构用固定容差报告检查，数值用 source 训练噪声标定，离散事实逐项精确。"""
+    root = Path(oracle["dir"])
+    structure = compare_tensor_archives(reference, candidate_path, profile="fp32-inference")
+    numerical = compare_noise_calibrated(
+        reference,
+        candidate_path,
+        root / "train_fp64.npz",
+        root / "train_alt.npz",
+        k=float(protocol.get("pass_k", 8.0)),
+        require_calibrated=True,
+        target_baseline_path=protocol.get("train_noise_baseline"),
+        drop_ustat_sum=protocol.get("train_envelope") == "train-repeat-envelope-v1-pilot",
+    )
+    exact = _exact_train_checks(
+        (oracle["capture"] or {}).get("train") or {}, (run["capture"] or {}).get("train") or {}
+    )
+    if exact:
+        # 离散事实不一致优先于数值：它们没有噪声，任何差异都是实现差异
+        numerical = {
+            **numerical,
+            "passed": False,
+            "first_divergence": exact[0],
+            "exact_failures": exact,
+        }
+    numerical["exact"] = {"passed": not exact, "failures": exact}
+    result = judge(oracle["capture"], run["capture"], structure, None, protocol, numerical=numerical)
+    result["train_exact"] = numerical["exact"]
+    result["mismatch"] = {"fp32": structure.get("metrics")}
     result["run_id"] = run["run_id"]
     result["candidate_identity"] = run["side_identity"]
     result["artifacts"] = {"reference": str(reference), "candidate": str(candidate_path)}
@@ -219,6 +285,57 @@ def verify_envelope(task: dict[str, Any], root: Path, *, trial: str = "t0") -> d
     return report
 
 
+def _numeric_only(result: dict[str, Any]) -> bool:
+    """本次运行除数值超限外全部合格：可运行、结构一致、权重完整、离散训练事实一致。"""
+    metrics = result.get("envelope_metrics") or {}
+    return (
+        result.get("runnable") == "pass"
+        and result.get("structural") == "pass"
+        and result.get("failure_code") in (None, "PARITY_FAILED")
+        and (result.get("train_exact") or {}).get("passed") is True
+        and metrics.get("numeric_only_failures") is True
+        and metrics.get("max_gating_usage") is not None
+    )
+
+
+def _marginal_rerun(
+    task: dict[str, Any],
+    root: Path,
+    trial: str,
+    oracle: dict[str, Any],
+    results: list[dict[str, Any]],
+    target_runs: list[dict[str, Any]],
+    rerun: dict[str, Any],
+) -> dict[str, Any] | None:
+    """临界加跑：首个失败只是数值超限且最大使用率在 (1, upper] 时，补跑到 runs 次取中位数。
+
+    已有的运行全部计入，不取最好一次；补跑中任何一次出现非数值失败即判失败。
+    """
+    last = results[-1]
+    usage = (last.get("envelope_metrics") or {}).get("max_gating_usage")
+    if not (_numeric_only(last) and usage is not None and 1 < usage <= rerun["upper"]):
+        return None
+    protocol = task["protocol"]
+    while len(results) < rerun["runs"]:
+        run = run_side(task, "target", root, trial=trial, oracle=Path(oracle["dir"]))
+        target_runs.append(run)
+        results.append(evaluate(oracle, run, protocol, task["target_identity"]))
+        if not _numeric_only(results[-1]):
+            break
+    eligible = len(results) >= rerun["runs"] and all(_numeric_only(item) for item in results)
+    usages = [(item.get("envelope_metrics") or {}).get("max_gating_usage") for item in results]
+    median = float(np.median(usages)) if eligible else None
+    return {
+        "triggered": True,
+        "upper": rerun["upper"],
+        "required_runs": rerun["runs"],
+        "runs": len(results),
+        "usages": usages,
+        "median_usage": median,
+        "passed": eligible and median is not None and median <= 1,
+    }
+
+
 def verify(task: dict[str, Any], root: Path, *, trial: str = "t0") -> dict[str, Any]:
     """正式验收：冻结 oracle，candidate 正常运行 repeats 次，全部通过才算通过。"""
     if task["protocol"]["profile"] in ("noise-envelope", ENVELOPE_V3):
@@ -238,6 +355,20 @@ def verify(task: dict[str, Any], root: Path, *, trial: str = "t0") -> dict[str, 
         if not results[-1]["passed"]:
             break  # 一次失败即不可能全部通过，保留已有证据即可
     repeat = judge_repeats(results, int(protocol["repeats"]))
+    marginal = None
+    if protocol.get("marginal_rerun") and oracle.get("ok") and not repeat["passed"] and results:
+        marginal = _marginal_rerun(
+            task, root, trial, oracle, results, target_runs, protocol["marginal_rerun"]
+        )
+        if marginal is not None:
+            repeat = {
+                "passed": marginal["passed"],
+                "required": int(protocol["repeats"]),
+                "runs": len(results),
+                "passed_runs": sum(item["passed"] for item in results),
+                "failure_code": None if marginal["passed"] else "PARITY_FAILED",
+                "marginal": True,
+            }
     target_physical = add_physical_cost(
         *(
             run_physical_cost(run, task["target"]["device"])
@@ -258,7 +389,12 @@ def verify(task: dict[str, Any], root: Path, *, trial: str = "t0") -> dict[str, 
         "mismatch": results[-1].get("mismatch") if results else None,
         "physical_cost": add_physical_cost(oracle.get("physical_cost"), target_physical),
         "repeats": repeat,
-        "summary": results[-1]["summary"] if results else "未运行",
+        "marginal_rerun": marginal,
+        "summary": (
+            "通过（临界加跑中位数）"
+            if marginal and marginal["passed"]
+            else (results[-1]["summary"] if results else "未运行")
+        ),
         "next": results[-1].get("next") if results else None,
         "oracle": oracle.get("dir"),
         "results": results,
