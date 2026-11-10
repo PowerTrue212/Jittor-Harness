@@ -3,7 +3,7 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "torchport"
+name = "jittor-harness"
 version = "0.38.3"
 description = "Jittor Harness：供迁移 Agent 调用的 PyTorch 到 Jittor 可复现执行与验证工具"
 readme = "README.md"
@@ -29,10 +29,11 @@ viz = [
 ]
 
 [project.scripts]
-torchport = "torchport.cli:main"
+jittor-harness = "jittor_harness.cli:main"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.setuptools]
+packages = ["jittor_harness", "jittor_harness.capture", "jittor_harness.comparison", "jittor_harness.contracts", "jittor_harness.diagnosis", "jittor_harness.runtime", "jittor_harness.verification"]
+package-dir = {"jittor_harness" = "src"}
 
 [tool.ruff]
 line-length = 100
@@ -40,6 +41,9 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["jittor_harness"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
